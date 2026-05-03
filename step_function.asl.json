@@ -1,0 +1,43 @@
+{
+  "Comment": "Banking transaction processor: valida -> evalua riesgo -> rutea a approved/ o review/",
+  "StartAt": "Validate",
+  "States": {
+    "Validate": {
+      "Type": "Task",
+      "Resource": "${validate_arn}",
+      "ResultPath": "$",
+      "Next": "CheckValidation"
+    },
+    "CheckValidation": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.validation_status",
+          "StringEquals": "VALID",
+          "Next": "RiskAssess"
+        }
+      ],
+      "Default": "ValidationFailed"
+    },
+    "ValidationFailed": {
+      "Type": "Fail",
+      "Error": "ValidationError",
+      "Cause": "La transaccion no paso la validacion. Revisa el campo validation_errors."
+    },
+    "RiskAssess": {
+      "Type": "Task",
+      "Resource": "${risk_assess_arn}",
+      "ResultPath": "$",
+      "Next": "Route"
+    },
+    "Route": {
+      "Type": "Task",
+      "Resource": "${route_arn}",
+      "ResultPath": "$",
+      "Next": "TransactionProcessed"
+    },
+    "TransactionProcessed": {
+      "Type": "Succeed"
+    }
+  }
+}
