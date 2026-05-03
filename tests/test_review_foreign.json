@@ -1,0 +1,7 @@
+{
+  "transaction_id": "transaction-0303",
+  "account": "9876-5432",
+  "amount": 200.00,
+  "country": "US",
+  "merchant": "Best Buy"
+}

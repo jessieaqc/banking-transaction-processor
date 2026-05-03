@@ -1,0 +1,7 @@
+{
+  "transaction_id": "transaction-bad1",
+  "account": "INVALIDO",
+  "amount": -100,
+  "country": "mexico",
+  "merchant": "Tienda Local"
+}

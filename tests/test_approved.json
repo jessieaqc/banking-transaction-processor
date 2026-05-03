@@ -1,0 +1,7 @@
+{
+  "transaction_id": "transaction-0001",
+  "account": "1234-5678",
+  "amount": 500.00,
+  "country": "MX",
+  "merchant": "Walmart"
+}
