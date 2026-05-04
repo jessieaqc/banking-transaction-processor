@@ -1,122 +1,126 @@
-# Demo CI/CD con OpenTofu y GitHub Actions
+# Banking Transaction Processor
 
-URL Shortener mínimo desplegado vía GitHub Actions con OIDC (sin access keys).
+Esta pipeline simula un sistema antifraude en un banco. Las transacciones pasar por tres lambdas a través de Step Functions donde se valida la estructura del JSON, se le da un nivel de riesgo financiero y se envía a la carpeta correspondiente en S3. 
+
+## ¿Qué hace el pipeline?
+
+El sistema decide si una transacción es segura o sospechosa siguiendo estas reglas de negocio:
+
+- **Aprobada** (`approved/`): esi el monto es menor o igual a 10000 y país de origen = `MX`
+- **En revisión** (`review/`): si el monto es mayor a 10000 o es un país distinto a `MX` 
+- **Fallida** (estado `Fail`): cuando los datos son inválidos (monto negativo, formato de cuenta incorrecto, o código de país mal formado)
 
 ## Arquitectura
 
 ```
-   POST /shorten         GET /{code}
-        │                     │
-        └──────┬──────────────┘
-               │
-        ┌──────▼───────┐
-        │ API Gateway  │  HTTP API
-        └──────┬───────┘
-               │
-        ┌──────▼───────┐
-        │   Lambda     │  Python 3.12
-        └──┬────────┬──┘
-           │        │
-    ┌──────▼──┐ ┌──▼──────────┐
-    │DynamoDB │ │  S3 logs    │
-    │ (urls)  │ │ (analytics) │
-    └─────────┘ └─────────────┘
+Input JSON
+     │
+     ▼
+┌──────────┐  INVALID  ┌──────────────────┐
+│ Validate │ ────────► │ ValidationFailed │  (Fail)
+└──────────┘           └──────────────────┘
+     │ VALID
+     ▼
+┌─────────────┐
+│ RiskAssess  │  Agrega: risk_level, risk_reasons
+└─────────────┘
+     │
+     ▼
+┌────────┐   low  -> s3://.../approved/<id>.json
+│ Route  │   high -> s3://.../review/<id>.json
+└────────┘
+     │
+     ▼
+┌──────────────────────┐
+│ TransactionProcessed │  (Succeed)
+└──────────────────────┘
+```
+
+El Step Function tiene **6 estados**, **1 Choice**, **1 Fail** y **1 Succeed**.
+
+## Lógica de cada Lambda
+
+| Lambda | Campos que lee | Campos que agrega |
+|---|---|---|
+| `validate` | `amount`, `country`, `account`, `transaction_id` | `validation_status`, `validation_errors` |
+| `risk_assess` | `amount`, `country` | `risk_level`, `risk_reasons` |
+| `route` | `transaction_id`, `risk_level` | `s3_bucket`, `s3_key`, `routed_to` |
+
+Cada lambda recibe el evento completo, le agrega sus campos y lo retorna. El Step Function pasa el resultado de cada Lambda a la siguiente usando `ResultPath: "$"`.
+
+## Despliegue
+
+### Paso 1: Bootstrap (solo la primera vez)
+
+Crea el bucket S3 donde se guarda el state remoto de OpenTofu.
+
+```bash
+cd bootstrap
+tofu init
+tofu apply
+```
+
+### Paso 2: Proyecto principal
+
+```bash
+cd ../banking-jessi
+tofu init
+tofu apply
 ```
 
 ## Flujo CI/CD
 
 ```
 ┌──────────────────────┐
-│ Pull request -> main │ ──> tofu plan (solo)
+│ Pull request a main  │  ──►  tofu plan (solo verifica)
 └──────────────────────┘
 
 ┌──────────────────────┐
-│ Push -> main         │ ──> tofu plan + tofu apply
+│ Push a main          │  ──►  tofu plan + tofu apply
 └──────────────────────┘
 ```
 
-GitHub Actions asume un rol IAM en AWS via **OIDC**. Sin access keys, sin secrets.
+El workflow `.github/workflows/tofu.yml` requiere dos secrets en GitHub:
+- `AWS_ACCESS_KEY_ID`
+- `AWS_SECRET_ACCESS_KEY`
 
-## Estructura
-
-```
-.
-├── .github/workflows/tofu.yml    # CI/CD pipeline
-├── bootstrap/                     # State backend + OIDC + rol GHA. UNA VEZ.
-│   ├── main.tf
-│   ├── variables.tf
-│   ├── outputs.tf
-│   └── README.md
-├── lambda/handler.py              # Codigo Python de la Lambda
-├── backend.tf                     # State remoto en S3
-├── main.tf                        # API GW + Lambda + DDB + S3
-├── iam.tf                         # Rol IAM de la Lambda
-├── variables.tf
-└── outputs.tf
-```
-
-## Setup completo (primera vez)
-
-### 1. Bootstrap
-
-Esto crea el bucket de state, el OIDC provider y el rol GHA. Solo se hace una vez.
+## Ejecutar pruebas
 
 ```bash
-cd bootstrap
-# Edita variables.tf: cambia var.github_repo a "tu-usuario/tu-repo"
-tofu init
-tofu apply
-# Anota los outputs: state_bucket y gha_role_arn
+SM_ARN=$(tofu output -raw state_machine_arn)
+BUCKET=$(tofu output -raw s3_bucket_name)
+
+# Caso 1: aprobada (monto bajo, pais MX)
+aws stepfunctions start-execution --state-machine-arn $SM_ARN \
+  --name "test-approved" \
+  --input file://tests/test_approved.json
+
+# Caso 2: revision por monto alto
+aws stepfunctions start-execution --state-machine-arn $SM_ARN \
+  --name "test-review-amount" \
+  --input file://tests/test_review_high_amount.json
+
+# Caso 3: revision por pais extranjero
+aws stepfunctions start-execution --state-machine-arn $SM_ARN \
+  --name "test-review-foreign" \
+  --input file://tests/test_review_foreign.json
+
+# Caso 4: falla por datos invalidos
+aws stepfunctions start-execution --state-machine-arn $SM_ARN \
+  --name "test-invalid" \
+  --input file://tests/test_invalid.json
+
+# verificar que los archivos cayeron en el prefijo correcto
+aws s3 ls s3://$BUCKET/ --recursive
 ```
 
-### 2. Configurar el proyecto principal
+
+## Destruir recursos
 
 ```bash
-cd ..
-
-# Edita backend.tf: pega state_bucket
-# Edita .github/workflows/tofu.yml: pega gha_role_arn como AWS_ROLE
-```
-
-### 3. Subir a GitHub y dejar que el CI/CD haga el resto
-
-```bash
-git init
-git add .
-git commit -m "initial commit"
-git remote add origin git@github.com:tu-usuario/tu-repo.git
-git push -u origin main
-```
-
-GitHub Actions correrá automáticamente: `plan` + `apply`. Verifica en la pestaña Actions del repo.
-
-## Probar la API
-
-```bash
-# Despues de que GHA aplique, busca el output api_url en el log de Actions.
-API="https://abc123.execute-api.us-east-1.amazonaws.com"
-
-# Acortar
-curl -X POST $API/shorten \
-  -H "Content-Type: application/json" \
-  -d '{"url":"https://www.uag.mx"}'
-# Respuesta: {"code":"Xz3aB9","short_url":"https://abc123.../Xz3aB9","original_url":"..."}
-
-# Visitar
-curl -L $API/Xz3aB9
-# Sigue el 302 a https://www.uag.mx
-```
-
-## Limpieza
-
-```bash
-# 1. Destruye el proyecto principal (lo puedes hacer via GHA borrando todo,
-#    o localmente):
+cd banking-transaction-processor
 tofu destroy
 
-# 2. Si quieres destruir TAMBIEN el bootstrap (state bucket + OIDC + rol):
-cd bootstrap
-# Edita main.tf: cambia force_destroy a true en aws_s3_bucket.state
-tofu apply  # aplica el cambio
-tofu destroy
+# si quieres eliminar bucket del state (bootstrap)
+aws s3 rb s3://banking-jessi-state-quintero --force
 ```
