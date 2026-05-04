@@ -1,40 +1,26 @@
 # main.tf
-# URL Shortener: API Gateway HTTP API + Lambda + DynamoDB + S3.
+# Banking Transaction Processor:
+#   S3 (almacenamiento) + 3 Lambdas + Step Function con Choice
 
 provider "aws" {
   region = var.aws_region
 }
 
 # -----------------------------------------------------------------------------
-# DynamoDB: tabla que guarda code -> url
+# S3: bucket donde para las transacciones procesadas
 # -----------------------------------------------------------------------------
 
-resource "aws_dynamodb_table" "urls" {
-  name         = "${var.project_name}-urls"
-  billing_mode = "PAY_PER_REQUEST" # on-demand, no cobra si no se usa
-  hash_key     = "code"
-
-  attribute {
-    name = "code"
-    type = "S"
-  }
-}
-
-# -----------------------------------------------------------------------------
-# S3: bucket para logs de visitas (analytics)
-# -----------------------------------------------------------------------------
-
-resource "random_id" "logs_suffix" {
+resource "random_id" "bucket_suffix" {
   byte_length = 4
 }
 
-resource "aws_s3_bucket" "logs" {
-  bucket        = "${var.project_name}-logs-${random_id.logs_suffix.hex}"
+resource "aws_s3_bucket" "transactions" {
+  bucket        = "${var.project_name}-transactions-${random_id.bucket_suffix.hex}"
   force_destroy = true
 }
 
-resource "aws_s3_bucket_public_access_block" "logs" {
-  bucket                  = aws_s3_bucket.logs.id
+resource "aws_s3_bucket_public_access_block" "transactions" {
+  bucket                  = aws_s3_bucket.transactions.id
   block_public_acls       = true
   block_public_policy     = true
   ignore_public_acls      = true
@@ -42,78 +28,64 @@ resource "aws_s3_bucket_public_access_block" "logs" {
 }
 
 # -----------------------------------------------------------------------------
-# Lambda: empaquetado del codigo Python + funcion
+# Lambdas: 3 funciones via modulo reutilizable
 # -----------------------------------------------------------------------------
 
-data "archive_file" "lambda_zip" {
-  type        = "zip"
-  source_dir  = "${path.module}/lambda"
-  output_path = "${path.module}/.build/handler.zip"
+module "lambda_validate" {
+  source        = "./modules/lambda_function"
+  function_name = "${var.project_name}-validate"
+  source_dir    = "${path.module}/lambdas/validate"
+  role_arn      = aws_iam_role.lambda_role.arn
 }
 
-resource "aws_lambda_function" "url_handler" {
-  function_name    = "${var.project_name}-handler"
-  filename         = data.archive_file.lambda_zip.output_path
-  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
-  role             = aws_iam_role.lambda_role.arn
-  handler          = "handler.lambda_handler"
-  runtime          = "python3.12"
-  timeout          = 10
+module "lambda_risk_assess" {
+  source        = "./modules/lambda_function"
+  function_name = "${var.project_name}-risk-assess"
+  source_dir    = "${path.module}/lambdas/risk_assess"
+  role_arn      = aws_iam_role.lambda_role.arn
+}
 
-  environment {
-    variables = {
-      TABLE_NAME = aws_dynamodb_table.urls.name
-      LOG_BUCKET = aws_s3_bucket.logs.bucket
-    }
+module "lambda_route" {
+  source        = "./modules/lambda_function"
+  function_name = "${var.project_name}-route"
+  source_dir    = "${path.module}/lambdas/route"
+  role_arn      = aws_iam_role.lambda_role.arn
+  environment_variables = {
+    BUCKET_NAME = aws_s3_bucket.transactions.bucket
   }
 }
 
-# Log group explicito para que tofu destroy lo limpie
-resource "aws_cloudwatch_log_group" "lambda_logs" {
-  name              = "/aws/lambda/${aws_lambda_function.url_handler.function_name}"
+# Log groups explicitos para que tofu destroy los limpie
+resource "aws_cloudwatch_log_group" "validate_logs" {
+  name              = "/aws/lambda/${module.lambda_validate.function_name}"
+  retention_in_days = 7
+}
+
+resource "aws_cloudwatch_log_group" "risk_assess_logs" {
+  name              = "/aws/lambda/${module.lambda_risk_assess.function_name}"
+  retention_in_days = 7
+}
+
+resource "aws_cloudwatch_log_group" "route_logs" {
+  name              = "/aws/lambda/${module.lambda_route.function_name}"
   retention_in_days = 7
 }
 
 # -----------------------------------------------------------------------------
-# API Gateway HTTP API
+# Step Function: orquesta las 3 Lambdas
 # -----------------------------------------------------------------------------
 
-resource "aws_apigatewayv2_api" "api" {
-  name          = "${var.project_name}-api"
-  protocol_type = "HTTP"
-}
+resource "aws_sfn_state_machine" "banking-jessi" {
+  name     = "${var.project_name}-state-machine"
+  role_arn = aws_iam_role.sfn_role.arn
 
-resource "aws_apigatewayv2_integration" "lambda" {
-  api_id                 = aws_apigatewayv2_api.api.id
-  integration_type       = "AWS_PROXY"
-  integration_uri        = aws_lambda_function.url_handler.invoke_arn
-  integration_method     = "POST"
-  payload_format_version = "2.0"
-}
+  definition = templatefile("${path.module}/step_function.asl.json", {
+    validate_arn    = module.lambda_validate.function_arn
+    risk_assess_arn = module.lambda_risk_assess.function_arn
+    route_arn       = module.lambda_route.function_arn
+  })
 
-resource "aws_apigatewayv2_route" "post_shorten" {
-  api_id    = aws_apigatewayv2_api.api.id
-  route_key = "POST /shorten"
-  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
-}
-
-resource "aws_apigatewayv2_route" "get_code" {
-  api_id    = aws_apigatewayv2_api.api.id
-  route_key = "GET /{code}"
-  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
-}
-
-resource "aws_apigatewayv2_stage" "default" {
-  api_id      = aws_apigatewayv2_api.api.id
-  name        = "$default"
-  auto_deploy = true
-}
-
-# Permiso para que API Gateway invoque la Lambda
-resource "aws_lambda_permission" "api_gw" {
-  statement_id  = "AllowAPIGatewayInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.url_handler.function_name
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.api.execution_arn}/*/*"
+  tags = {
+    Project = var.project_name
+  }
 }

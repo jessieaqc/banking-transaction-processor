@@ -3,7 +3,7 @@
 variable "project_name" {
   type        = string
   description = "Prefijo para todos los recursos."
-  default     = "demo-cicd-tofu"
+  default     = "banking-jessi"
 }
 
 variable "aws_region" {

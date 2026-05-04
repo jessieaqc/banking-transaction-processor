@@ -24,12 +24,9 @@ terraform {
   }
 
   backend "s3" {
-    # CAMBIA esto por tu bucket. Lo imprime el output del bootstrap.
-    bucket = "demo-cicd-tofu-state-CAMBIAME"
-
-    key            = "url-shortener/terraform.tfstate"
-    region         = "us-east-1"
-    dynamodb_table = "demo-cicd-tofu-locks"
-    encrypt        = true
+    bucket  = "banking-jessi-state-quintero"
+    key     = "banking-jessi/terraform.tfstate"
+    region  = "us-east-1"
+    encrypt = true
   }
 }
