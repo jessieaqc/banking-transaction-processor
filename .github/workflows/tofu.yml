@@ -2,7 +2,7 @@ name: OpenTofu
 
 # Patron canonico:
 #   - Pull request a main  -> tofu plan (sin apply, solo verifica)
-#   - Push a main          -> tofu plan + tofu apply
+#   - Push a main          -> tofu plan + tofu apply + tests
 #   - workflow_dispatch    -> tofu destroy (requiere confirmar escribiendo "destroy")
 
 on:
@@ -59,6 +59,59 @@ jobs:
       - name: tofu apply
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: tofu apply -no-color -auto-approve tfplan
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    needs: tofu
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+
+      - name: tofu init
+        run: tofu init
+
+      - name: Obtener ARN del Step Function
+        run: echo "SM_ARN=$(tofu output -raw state_machine_arn)" >> $GITHUB_ENV
+
+      - name: Ejecutar tests
+        run: |
+          for test in tests/test_approved.json tests/test_review_high_amount.json tests/test_review_foreign.json tests/test_invalid.json; do
+            echo "▶ Ejecutando $test"
+            EXECUTION_ARN=$(aws stepfunctions start-execution \
+              --state-machine-arn $SM_ARN \
+              --input file://$test \
+              --query executionArn --output text)
+
+            echo "  Esperando resultado..."
+            aws stepfunctions wait execution-complete \
+              --execution-arn $EXECUTION_ARN
+
+            STATUS=$(aws stepfunctions describe-execution \
+              --execution-arn $EXECUTION_ARN \
+              --query status --output text)
+
+            echo "  Status: $STATUS"
+
+            if [[ "$test" == *"invalid"* ]]; then
+              [ "$STATUS" = "FAILED" ] && echo "  ✓ PASS" || { echo "  ✗ FAIL (esperaba FAILED)"; exit 1; }
+            else
+              [ "$STATUS" = "SUCCEEDED" ] && echo "  ✓ PASS" || { echo "  ✗ FAIL (esperaba SUCCEEDED)"; exit 1; }
+            fi
+          done
 
   destroy:
     name: destroy
