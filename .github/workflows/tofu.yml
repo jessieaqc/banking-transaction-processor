@@ -3,12 +3,18 @@ name: OpenTofu
 # Patron canonico:
 #   - Pull request a main  -> tofu plan (sin apply, solo verifica)
 #   - Push a main          -> tofu plan + tofu apply
+#   - workflow_dispatch    -> tofu destroy (requiere confirmar escribiendo "destroy")
 
 on:
   pull_request:
     branches: [main]
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Escribe "destroy" para confirmar'
+        required: true
 
 permissions:
   contents: read
@@ -21,6 +27,7 @@ jobs:
   tofu:
     name: ${{ github.event_name == 'pull_request' && 'plan' || 'apply' }}
     runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch'
 
     steps:
       - uses: actions/checkout@v4
@@ -49,7 +56,32 @@ jobs:
       - name: tofu plan
         run: tofu plan -no-color -out=tfplan
 
-      # Solo aplicamos en push a main (no en PRs).
       - name: tofu apply
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: tofu apply -no-color -auto-approve tfplan
+
+  destroy:
+    name: destroy
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.confirm == 'destroy'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+
+      - name: tofu init
+        run: tofu init
+
+      - name: tofu destroy
+        run: tofu destroy -no-color -auto-approve
