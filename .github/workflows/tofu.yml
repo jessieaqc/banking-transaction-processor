@@ -97,12 +97,15 @@ jobs:
               --query executionArn --output text)
 
             echo "  Esperando resultado..."
-            aws stepfunctions wait execution-complete \
-              --execution-arn $EXECUTION_ARN
-
-            STATUS=$(aws stepfunctions describe-execution \
-              --execution-arn $EXECUTION_ARN \
-              --query status --output text)
+            for i in $(seq 1 30); do
+              STATUS=$(aws stepfunctions describe-execution \
+                --execution-arn $EXECUTION_ARN \
+                --query status --output text)
+              if [[ "$STATUS" != "RUNNING" ]]; then
+                break
+              fi
+              sleep 2
+            done
 
             echo "  Status: $STATUS"
 
